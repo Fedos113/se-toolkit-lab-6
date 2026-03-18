@@ -1,53 +1,344 @@
 # Agent Implementation Documentation
 
 ## 1. Overview
-This document details the implementation of `agent.py`, a foundational CLI tool that connects to an LLM (OpenAI) to answer user questions. It serves as the base for future agentic capabilities involving tools and loops.
+
+This document details the implementation of `agent.py`, a CLI tool that connects to an LLM via an OpenAI-compatible API to answer user questions using an **agentic loop** with tool calls. The agent can navigate and read the project wiki using `read_file` and `list_files` tools.
 
 ## 2. Architecture & Flow
-The agent follows a linear pipeline:
-`CLI Input` → `Argument Parsing` → `LLM API Call` → `JSON Formatting` → `Stdout Output`
+
+### Agentic Loop
+
+The agent implements a ReAct-style loop:
+
+```
+Question → LLM (with tool schemas) → tool_calls?
+    │                                   │
+    │ no                                │ yes
+    │                                   ▼
+    │                           Execute tool(s)
+    │                                   │
+    │                                   ▼
+    │                           Append tool results as "tool" role
+    │                                   │
+    │                                   ▼
+    └─────────────────────────── Back to LLM (max 10 iterations)
+                                        │
+                                        ▼
+                                   Final answer → JSON output
+```
+
+### Key Components
+
+1. **Tool Functions**: `read_file()` and `list_files()` with path security validation.
+2. **Tool Schemas**: OpenAI function-calling format for LLM.
+3. **Agentic Loop**: Iterative LLM calls with tool execution (max 10 iterations).
+4. **System Prompt**: Instructs LLM to use tools and cite sources.
 
 ### Key Constraints
+
 - **Input**: Single string argument (the question).
-- **Output**: Strictly valid JSON on `stdout`.
+- **Output**: Strictly valid JSON on `stdout` with `answer`, `source`, and `tool_calls` fields.
 - **Debug/Errors**: All non-JSON output (logs, errors, usage) goes to `stderr`.
-- **Timeout**: Maximum 60 seconds for the LLM response.
+- **Timeout**: Maximum 60 seconds per LLM call.
+- **Max Iterations**: 10 tool call iterations per question.
 - **Exit Codes**: `0` for success, `1` for failure.
 
-## 3. Step-by-Step Implementation Logic
+### LLM Provider
+
+The agent uses **Qwen Code API** deployed on a VM via [`qwen-code-oai-proxy`](https://github.com/inno-se-toolkit/qwen-code-oai-proxy). This proxy exposes Qwen Code through an OpenAI-compatible API.
+
+| Model              | Tool calling | Notes                                        |
+| ------------------ | ------------ | -------------------------------------------- |
+| `qwen3-coder-plus` | Strong       | Recommended, default                         |
+| `coder-model`      | Strong       | Qwen 3.5 Plus                                |
+
+## 3. Configuration
+
+The agent reads configuration from `.env.agent.secret` (created from `.env.agent.example`):
+
+| Variable        | Description                                      | Example                                      |
+| --------------- | ------------------------------------------------ | -------------------------------------------- |
+| `LLM_API_KEY`   | API key for Qwen Code authentication             | `your-qwen-api-key`                          |
+| `LLM_API_BASE`  | Base URL of the Qwen Code API proxy              | `http://<vm-ip>:<port>/v1`                   |
+| `LLM_MODEL`     | Model name to use                                | `qwen3-coder-plus`                           |
+
+> **Note:** This is **not** the same as `LMS_API_KEY` in `.env.docker.secret`. That one protects your backend LMS endpoints. `LLM_API_KEY` authenticates with your LLM provider.
+
+## 4. Tools
+
+### `read_file`
+
+Read a file from the project repository.
+
+**Parameters**:
+- `path` (string, required): Relative path from project root (e.g., `wiki/git-workflow.md`).
+
+**Returns**: File contents as a string, or an error message if the file doesn't exist.
+
+**Security**:
+- Rejects paths containing `..` (directory traversal).
+- Rejects absolute paths.
+- Verifies resolved path is within project directory.
+
+**Example**:
+```python
+read_file("wiki/git-workflow.md")
+# Returns: "# Git workflow\n\n..."
+```
+
+### `list_files`
+
+List files and directories at a given path.
+
+**Parameters**:
+- `path` (string, required): Relative directory path from project root (e.g., `wiki`).
+
+**Returns**: Newline-separated listing of entries, or an error message.
+
+**Security**:
+- Rejects paths containing `..` (directory traversal).
+- Rejects absolute paths.
+- Verifies resolved path is within project directory.
+
+**Example**:
+```python
+list_files("wiki")
+# Returns: "api.md\narchitectural-views.md\n..."
+```
+
+### Path Security Implementation
+
+Both tools use `validate_path()` to ensure security:
+
+1. Check for `..` in path (directory traversal attempt).
+2. Check if path is absolute (must be relative).
+3. Resolve full path: `PROJECT_ROOT / path`.
+4. Verify resolved path starts with `PROJECT_ROOT`.
+
+If any check fails, returns a security error message.
+
+## 5. Tool Schemas (Function Calling)
+
+Tools are registered with the LLM using OpenAI function-calling format:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read a file from the project repository...",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative path from project root"
+        }
+      },
+      "required": ["path"]
+    }
+  }
+}
+```
+
+The LLM uses these schemas to decide which tool to call and with what arguments.
+
+## 6. System Prompt Strategy
+
+The system prompt instructs the LLM to:
+
+1. Use `list_files` to discover wiki files.
+2. Use `read_file` to read relevant files and find answers.
+3. Always cite sources in `wiki/filename.md#section-anchor` format.
+4. Answer concisely and directly.
+5. Not make up information.
+
+```
+You are a documentation assistant for a software engineering lab project.
+
+You have access to two tools:
+- list_files: List files and directories at a given path
+- read_file: Read the contents of a file
+
+When answering questions about the project:
+1. Use list_files to discover what wiki files exist
+2. Use read_file to read relevant wiki files and find answers
+3. Always cite your source as "wiki/filename.md#section-anchor" format
+4. Answer concisely and directly
+
+Do not make up information. Only answer based on what you read from files.
+If you cannot find the answer in the wiki, say so honestly.
+```
+
+## 7. Step-by-Step Implementation Logic
 
 ### Step 1: Imports and Setup
-The script imports necessary standard libraries for system interaction, JSON handling, and error management, along with the OpenAI SDK.
-- `sys`: For command-line arguments (`argv`) and stream control (`stdout`, `stderr`).
-- `json`: To serialize the final response dictionary.
-- `openai`: To initialize the client and communicate with the LLM.
 
-### Step 2: Argument Validation
-Upon execution, the script checks `sys.argv`:
-- If fewer than 2 arguments are present (script name + question), it prints a usage message to `stderr` and exits with code `1`.
-- If valid, the question is extracted from `sys.argv[1]`.
+The script imports standard libraries for system interaction, JSON handling, path manipulation, and environment management, along with the OpenAI SDK.
 
-### Step 3: LLM Client Initialization
-An `OpenAI` client instance is created.
-- **Authentication**: Relies on the `OPENAI_API_KEY` environment variable.
-- **Model Selection**: Configured to use `gpt-4o` (configurable constant).
+### Step 2: Constants
 
-### Step 4: Constructing the API Request
-The script calls `client.chat.completions.create()` with specific parameters:
-- **Messages**: A list containing:
-  1. A `system` message defining the persona ("helpful assistant", "answer concisely").
-  2. A `user` message containing the input question.
-- **Max Tokens**: Limited to 500 to ensure brevity and speed.
-- **Timeout**: Set to `60` seconds to enforce the response time rule.
+- `PROJECT_ROOT`: Absolute path to project directory (parent of `agent.py`).
+- `MAX_ITERATIONS`: Maximum tool call iterations (10).
 
-### Step 5: Processing the Response
-- The script extracts the content from the first choice in the response (`response.choices[0].message.content`).
-- Whitespace is stripped to ensure clean output.
+### Step 3: Environment Loading
 
-### Step 6: Formatting the Output
-A Python dictionary is constructed to match the required schema:
-```python
-result = {
-    "answer": "<extracted_text>",
-    "tool_calls": []  # Reserved for Task 2
+The `load_env()` function reads `.env.agent.secret` if it exists, parsing key-value pairs and setting environment variables.
+
+### Step 4: Path Security
+
+The `validate_path()` function checks:
+- No `..` in path.
+- Path is not absolute.
+- Resolved path is within `PROJECT_ROOT`.
+
+### Step 5: Tool Functions
+
+- `read_file(path)`: Validates path, reads file, returns contents or error.
+- `list_files(path)`: Validates path, lists directory, returns entries or error.
+
+### Step 6: Tool Schemas
+
+`TOOL_SCHEMAS` defines both tools in OpenAI function-calling format.
+
+### Step 7: Agentic Loop
+
+The `run_agentic_loop()` function:
+
+1. Initializes messages with system prompt and user question.
+2. Loops up to `MAX_ITERATIONS`:
+   - Calls LLM with `tools=TOOL_SCHEMAS`.
+   - If `tool_calls` present:
+     - Executes each tool via `execute_tool_call()`.
+     - Appends results as `{"role": "tool", ...}` messages.
+     - Continues loop.
+   - If no `tool_calls`:
+     - Extracts answer and source.
+     - Returns JSON result.
+3. If max iterations reached, returns partial result.
+
+### Step 8: Tool Execution
+
+`execute_tool_call()`:
+- Extracts tool name and arguments from tool call.
+- Calls corresponding function from `TOOL_FUNCTIONS`.
+- Returns dict with `tool`, `args`, and `result`.
+
+### Step 9: Source Extraction
+
+`extract_source_from_answer()`:
+- Uses regex to find `wiki/*.md#anchor` patterns in answer.
+- Falls back to extracting from tool call args.
+- Defaults to `"wiki"` if no source found.
+
+### Step 10: Main Function
+
+1. Validates command-line arguments.
+2. Loads environment.
+3. Initializes OpenAI client.
+4. Runs agentic loop.
+5. Outputs JSON to stdout.
+
+## 8. Output JSON Structure
+
+```json
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {
+      "tool": "list_files",
+      "args": {"path": "wiki"},
+      "result": "git-workflow.md\n..."
+    },
+    {
+      "tool": "read_file",
+      "args": {"path": "wiki/git-workflow.md"},
+      "result": "# Git workflow\n\n..."
+    }
+  ]
 }
+```
+
+### Fields
+
+- `answer` (string): The final answer from the LLM.
+- `source` (string): Wiki section reference (e.g., `wiki/git-workflow.md#section`).
+- `tool_calls` (array): All tool calls made during the loop. Each entry has:
+  - `tool`: Tool name (`read_file` or `list_files`).
+  - `args`: Arguments passed to the tool.
+  - `result`: Tool output (file contents or directory listing).
+
+## 9. Usage
+
+### Basic Usage
+
+```bash
+# Copy and configure environment
+cp .env.agent.example .env.agent.secret
+# Edit .env.agent.secret with your LLM credentials
+
+# Run the agent
+uv run agent.py "How do you resolve a merge conflict?"
+```
+
+### Expected Output
+
+```json
+{
+  "answer": "Edit the conflicting file...",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [...]
+}
+```
+
+### Debug Output (stderr)
+
+```
+Calling LLM: qwen3-coder-plus...
+Iteration 1/10
+Executing tool: list_files with args: {'path': 'wiki'}
+Iteration 2/10
+Executing tool: read_file with args: {'path': 'wiki/git-workflow.md'}
+Done.
+```
+
+## 10. Error Handling
+
+| Error                          | Behavior                                           |
+| ------------------------------ | -------------------------------------------------- |
+| Missing command-line argument  | Prints usage to stderr, exits with code `1`        |
+| Missing `LLM_API_KEY`          | Prints error to stderr, exits with code `1`        |
+| Path traversal attempt         | Returns security error as tool result              |
+| File not found                 | Returns error message as tool result               |
+| API connection failure         | Prints exception to stderr, exits with code `1`    |
+| Timeout (>60 seconds)          | Raises exception, handled by generic error handler |
+| Max iterations reached         | Returns partial answer with tool results           |
+
+## 11. Testing
+
+To test the agent:
+
+```bash
+# Run a single question
+uv run agent.py "What files are in the wiki?"
+
+# Run the evaluation script
+uv run python test_agent.py
+```
+
+### Test Cases
+
+1. **Merge conflict question**: `"How do you resolve a merge conflict?"`
+   - Expects: `read_file` in tool_calls, `wiki/git-workflow.md` in source.
+
+2. **Wiki listing question**: `"What files are in the wiki?"`
+   - Expects: `list_files` in tool_calls.
+
+### Test Verification
+
+Tests verify:
+- Valid JSON output.
+- Presence of `answer`, `source`, and `tool_calls` fields.
+- Correct field types.
+- Expected tools are called for specific questions.
