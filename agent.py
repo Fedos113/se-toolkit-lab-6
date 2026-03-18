@@ -93,30 +93,81 @@ def read_file(path: str) -> str:
 def list_files(path: str) -> str:
     """
     List files and directories at a given path.
-    
+
     Parameters:
         path: Relative directory path from project root.
-    
+
     Returns:
         Newline-separated listing of entries, or error message.
     """
     is_valid, error = validate_path(path)
     if not is_valid:
         return error
-    
+
     full_path = PROJECT_ROOT / path
-    
+
     if not full_path.exists():
         return f"Error: Directory not found: {path}"
-    
+
     if not full_path.is_dir():
         return f"Error: Not a directory: {path}"
-    
+
     try:
         entries = os.listdir(full_path)
         return "\n".join(sorted(entries))
     except Exception as e:
         return f"Error listing directory: {e}"
+
+
+def query_api(method: str, path: str, body: str = None) -> str:
+    """
+    Send an HTTP request to the backend API.
+
+    Parameters:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API path (e.g., '/items/', '/analytics/completion-rate')
+        body: Optional JSON request body for POST/PUT requests
+
+    Returns:
+        JSON string with status_code and body fields.
+    """
+    import urllib.request
+    import urllib.error
+    import json
+
+    # Read configuration from environment variables
+    api_key = os.environ.get("LMS_API_KEY", "")
+    base_url = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+
+    url = f"{base_url}{path}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    data = body.encode() if body else None
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            response_body = resp.read().decode()
+            return json.dumps({
+                "status_code": resp.status,
+                "body": response_body
+            })
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        return json.dumps({
+            "status_code": e.code,
+            "body": error_body
+        })
+    except Exception as e:
+        return json.dumps({
+            "status_code": 0,
+            "body": f"Error: {str(e)}"
+        })
 
 
 # Tool schemas for OpenAI function calling
@@ -154,30 +205,64 @@ TOOL_SCHEMAS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Send an HTTP request to the backend API. Use for data queries like item counts, analytics, or checking API responses. Returns JSON with status_code and body.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE, etc.)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    }
+                },
+                "required": ["method", "path"]
+            }
+        }
     }
 ]
 
 # Map tool names to functions
 TOOL_FUNCTIONS = {
     "read_file": read_file,
-    "list_files": list_files
+    "list_files": list_files,
+    "query_api": query_api
 }
 
 # System prompt for the documentation agent
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering lab project.
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab project.
 
-You have access to two tools:
+You have access to three tools:
 - list_files: List files and directories at a given path
 - read_file: Read the contents of a file
+- query_api: Send HTTP requests to the backend API
 
-When answering questions about the project:
-1. Use list_files to discover what wiki files exist
-2. Use read_file to read relevant wiki files and find answers
-3. Always cite your source as "wiki/filename.md#section-anchor" format
-4. Answer concisely and directly
+Tool selection guidance:
+- Use list_files to discover what files exist in a directory
+- Use read_file to read wiki documentation, source code, or configuration files
+- Use query_api to query the running backend API for data (item counts, analytics, etc.)
+  or to check API behavior (status codes, errors)
 
-Do not make up information. Only answer based on what you read from files.
-If you cannot find the answer in the wiki, say so honestly.
+When answering questions:
+1. For wiki/documentation questions: use read_file on wiki/*.md files
+2. For source code questions: use read_file on backend/app/*.py files
+3. For data queries (how many items, what's the completion rate): use query_api
+4. For API behavior questions (status codes, errors): use query_api
+
+Always cite your source. Answer concisely and directly.
+Do not make up information. Only answer based on what you read or query.
+If you cannot find the answer, say so honestly.
 """
 
 
